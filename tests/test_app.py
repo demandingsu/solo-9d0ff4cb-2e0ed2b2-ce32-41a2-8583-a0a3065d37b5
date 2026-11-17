@@ -199,7 +199,9 @@ def test_upload_of_one_bad_file_does_not_replace_the_other(client: TestClient):
     upload(client, baseline=True, samples=True)
     store: Store = client.app_state.store
     before = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
     bad_samples = "sample_id,Fe,SiO2,Al2O3,CaO\nS1,1,2,3,4\nS1,5,6,7,8\n"
     new_base = BASE_CSV.replace("62.3", "63.1")
@@ -212,7 +214,9 @@ def test_upload_of_one_bad_file_does_not_replace_the_other(client: TestClient):
     )
     assert response.status_code == 400
     after = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
     assert after == before
 
@@ -339,7 +343,9 @@ def test_interleaved_upload_discards_inflight_computation(
     store: Store = client.app_state.store
     upload(client, baseline=True, samples=True)
     before_versions = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
 
     def compute_and_upload(baseline, samples):
@@ -357,7 +363,9 @@ def test_interleaved_upload_discards_inflight_computation(
     assert latest(client)["report"] is None
     # The upload that raced did take effect (whole-file replacement).
     after_versions = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
     assert after_versions["baseline"] == before_versions["baseline"]
     assert after_versions["samples"] == before_versions["samples"] + 1
@@ -396,7 +404,9 @@ def test_upload_failure_keeps_previous_inputs(client: TestClient, monkeypatch):
     register(client)
     store: Store = client.app_state.store
     before = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
 
     def broken_save(*args, **kwargs):
@@ -410,7 +420,9 @@ def test_upload_failure_keeps_previous_inputs(client: TestClient, monkeypatch):
     assert response.status_code == 400
     assert "原有输入未被替换" in response.text
     after = {
-        kind: value.version_id for kind, value in store.current_inputs().items()
+        kind: value.version_id
+        for kind, value in store.current_inputs().items()
+        if value is not None
     }
     assert after == before
     assert latest(client)["report"]["stale"] is False

@@ -1,8 +1,10 @@
 """Exact simplex least-squares solver for ore-blend proportions.
 
-The three raw ores form the columns of a 4x3 matrix ``A`` and a finished
-sample is a 4-vector ``y``.  We minimise ``||A w - y||^2`` over the
-probability simplex ``w >= 0, sum(w) = 1``.
+The three raw ores form the columns of an elements x 3 matrix ``A`` (the
+application uses four elements; re-measurement plans validate against the
+augmented matrix with extra rows) and a finished sample is the matching
+vector ``y``.  We minimise ``||A w - y||^2`` over the probability simplex
+``w >= 0, sum(w) = 1``.
 
 All arithmetic is exact (:class:`fractions.Fraction`).  This is important
 because the task requires an exact "is the optimum unique?" answer: when
@@ -313,25 +315,26 @@ def _face_candidate(
 # ---------------------------------------------------------------------------
 
 
-def solve_sample(
+def _check_shapes(
     a: Sequence[Sequence[Fraction]], y: Sequence[Fraction]
-) -> SampleSolution:
-    """Solve one sample exactly.
+) -> None:
+    if not a or any(len(row) != 3 for row in a):
+        raise ValueError("baseline matrix must have exactly 3 ore columns")
+    if len(y) != len(a):
+        raise ValueError("sample vector must have one value per element row")
 
-    ``a`` has shape 4 x 3 (rows are elements, columns are ores) and ``y``
-    has length 4.
-    """
 
-    if len(a) != 4 or any(len(row) != 3 for row in a):
-        raise ValueError("baseline matrix must be 4x3")
-    if len(y) != 4:
-        raise ValueError("sample vector must have length 4")
+def _optimal_candidates(
+    a: Sequence[Sequence[Fraction]], y: Sequence[Fraction]
+) -> tuple[Fraction, list[FaceCandidate]]:
+    """Best attainable SSE and the face candidates attaining it."""
 
+    elements = len(a)
     q = [
-        [sum(a[e][i] * a[e][j] for e in range(4)) for j in range(3)]
+        [sum(a[e][i] * a[e][j] for e in range(elements)) for j in range(3)]
         for i in range(3)
     ]
-    b = [sum(a[e][i] * y[e] for e in range(4)) for i in range(3)]
+    b = [sum(a[e][i] * y[e] for e in range(elements)) for i in range(3)]
 
     candidates: list[FaceCandidate] = []
     for m in (1, 2, 3):
@@ -344,40 +347,33 @@ def solve_sample(
         raise AssertionError("no stationary candidate found")
 
     best = min(candidate.sse for candidate in candidates)
-    optimal = [candidate for candidate in candidates if candidate.sse == best]
+    return best, [candidate for candidate in candidates if candidate.sse == best]
 
-    # --- unique point ---------------------------------------------------
-    if len(optimal) == 1 and optimal[0].dim == 0:
-        point = optimal[0].point
-        assert point is not None
-        predicted = _predict(a, point)
-        residuals = tuple(y[e] - predicted[e] for e in range(4))
-        return SampleSolution(
-            sse=best,
-            unique=True,
-            weights=point,
-            weight_ranges=tuple((value, value) for value in point),
-            predicted=predicted,
-            residuals=residuals,
-            predicted_ranges=tuple((value, value) for value in predicted),
-            residual_ranges=tuple((value, value) for value in residuals),
-        )
 
-    # --- non-unique optimum --------------------------------------------
-    # Collect the extreme points of the optimal set.  A face candidate is
-    # a point, an open segment, or the whole triangle; the extreme points
-    # are the endpoints.  Bounding each linear functional over these
-    # extremes gives the exact interval of attainable values.
-    extremes: list[tuple[Fraction, ...]] = []
+def _extreme_points(
+    optimal: Iterable[FaceCandidate],
+) -> list[tuple[Fraction, ...]]:
+    """Deduplicated extreme points of the optimal set.
+
+    A face candidate is a point, an open segment, or the whole triangle;
+    its extreme points are the endpoints (or the three vertices).
+    """
+
+    points: list[tuple[Fraction, ...]] = []
+
+    def add(point: tuple[Fraction, ...]) -> None:
+        if point not in points:
+            points.append(point)
+
     for candidate in optimal:
         if candidate.dim == 0:
             assert candidate.point is not None
-            extremes.append(candidate.point)
+            add(candidate.point)
         elif candidate.dim == 2:
             for vertex in range(3):
                 point = [Fraction(0), Fraction(0), Fraction(0)]
                 point[vertex] = Fraction(1)
-                extremes.append(tuple(point))
+                add(tuple(point))
         else:
             assert (
                 candidate.lam0 is not None
@@ -391,7 +387,61 @@ def solve_sample(
                     point[lagrange_index] = (
                         candidate.lam0[idx] + t * candidate.direction[idx]
                     )
-                extremes.append(tuple(point))
+                add(tuple(point))
+    return points
+
+
+def optimal_set_extremes(
+    a: Sequence[Sequence[Fraction]], y: Sequence[Fraction]
+) -> tuple[Fraction, list[tuple[Fraction, ...]]]:
+    """Best SSE and the extreme points of the whole optimal set.
+
+    The optimal set of this convex problem is the convex hull of the
+    returned points: a single point (unique optimum), a segment, or the
+    full triangle.  Everything is exact.
+    """
+
+    _check_shapes(a, y)
+    best, optimal = _optimal_candidates(a, y)
+    return best, _extreme_points(optimal)
+
+
+def solve_sample(
+    a: Sequence[Sequence[Fraction]], y: Sequence[Fraction]
+) -> SampleSolution:
+    """Solve one sample exactly.
+
+    ``a`` has one row per element and exactly 3 ore columns; ``y`` has one
+    value per element row.  (The application always uses 4 elements; the
+    re-measurement plans validate their conclusion on the augmented
+    5-or-6-element problem with the same solver.)
+    """
+
+    _check_shapes(a, y)
+    best, optimal = _optimal_candidates(a, y)
+
+    # --- unique point ---------------------------------------------------
+    if len(optimal) == 1 and optimal[0].dim == 0:
+        point = optimal[0].point
+        assert point is not None
+        predicted = _predict(a, point)
+        residuals = tuple(y[e] - predicted[e] for e in range(len(a)))
+        return SampleSolution(
+            sse=best,
+            unique=True,
+            weights=point,
+            weight_ranges=tuple((value, value) for value in point),
+            predicted=predicted,
+            residuals=residuals,
+            predicted_ranges=tuple((value, value) for value in predicted),
+            residual_ranges=tuple((value, value) for value in residuals),
+        )
+
+    # --- non-unique optimum --------------------------------------------
+    # Collect the extreme points of the optimal set.  Bounding each linear
+    # functional over these extremes gives the exact interval of attainable
+    # values.
+    extremes = _extreme_points(optimal)
 
     def bounds(function) -> tuple[Fraction, Fraction]:
         values = [function(point) for point in extremes]
@@ -405,10 +455,10 @@ def solve_sample(
         values = [item[i] for item in predicted_extremes]
         return min(values), max(values)
 
-    predicted_ranges = tuple(predicted_bound(i) for i in range(4))
+    predicted_ranges = tuple(predicted_bound(i) for i in range(len(a)))
     residual_ranges = tuple(
         (y[i] - predicted_ranges[i][1], y[i] - predicted_ranges[i][0])
-        for i in range(4)
+        for i in range(len(a))
     )
 
     return SampleSolution(
@@ -427,5 +477,96 @@ def _predict(
     a: Sequence[Sequence[Fraction]], weights: Sequence[Fraction]
 ) -> tuple[Fraction, ...]:
     return tuple(
-        sum(a[e][j] * weights[j] for j in range(3)) for e in range(4)
+        sum(a[e][j] * weights[j] for j in range(3)) for e in range(len(a))
     )
+
+
+# ---------------------------------------------------------------------------
+# Distinguishing the optimal set with extra measurements
+# ---------------------------------------------------------------------------
+
+
+def matrix_rank(matrix: Sequence[Sequence[Fraction]]) -> int:
+    """Exact rank of a small rational matrix."""
+
+    rows = [list(row) for row in matrix]
+    if not rows:
+        return 0
+    ncols = len(rows[0])
+    rank = 0
+    for col in range(ncols):
+        pivot = next(
+            (r for r in range(rank, len(rows)) if rows[r][col] != 0), None
+        )
+        if pivot is None:
+            continue
+        rows[rank], rows[pivot] = rows[pivot], rows[rank]
+        scale = rows[rank][col]
+        rows[rank] = [value / scale for value in rows[rank]]
+        for r in range(len(rows)):
+            if r != rank and rows[r][col] != 0:
+                factor = rows[r][col]
+                rows[r] = [
+                    rows[r][c] - factor * rows[rank][c] for c in range(ncols)
+                ]
+        rank += 1
+    return rank
+
+
+def difference_basis(
+    points: Sequence[Sequence[Fraction]],
+) -> list[list[Fraction]]:
+    """Basis of the difference space spanned by the optimal-set extremes.
+
+    The result has dimension 0 (singleton), 1 (segment) or 2 (the whole
+    triangle); every direction along which the optimal blend can vary is a
+    combination of these basis vectors.
+    """
+
+    if not points:
+        return []
+    first = points[0]
+    return _independent_vectors(
+        [
+            [point[i] - first[i] for i in range(len(first))]
+            for point in points[1:]
+        ]
+    )
+
+
+def separating_subsets(
+    points: Sequence[Sequence[Fraction]],
+    rows: Sequence[Sequence[Fraction]],
+    max_size: int = 2,
+) -> tuple[int | None, list[tuple[int, ...]]]:
+    """Minimal subsets of measurement rows that separate the optimal set.
+
+    ``points`` are the extreme points of the current optimal set and
+    ``rows[e]`` gives the content of candidate element ``e`` per ore.  A
+    subset *separates* when no two distinct optimal blends agree on every
+    measured element, i.e. when the restrictions of the rows to the
+    difference space of ``points`` have full rank.  Returns the minimal
+    subset size (``None`` when no subset of up to ``max_size`` rows works)
+    and every separating subset of that size, as index tuples.
+    """
+
+    basis = difference_basis(points)
+    if not basis:
+        raise ValueError("the optimal set is already a single point")
+
+    def separates(indices: Iterable[int]) -> bool:
+        restricted = [
+            [sum(rows[e][j] * d[j] for j in range(len(d))) for d in basis]
+            for e in indices
+        ]
+        return matrix_rank(restricted) == len(basis)
+
+    for size in range(1, max_size + 1):
+        working = [
+            combo
+            for combo in combinations(range(len(rows)), size)
+            if separates(combo)
+        ]
+        if working:
+            return size, working
+    return None, []

@@ -4,9 +4,11 @@
 <section class="card" id="upload">
   <h2>1. 上传输入（整版替换）</h2>
   <p class="hint">
-    每次上传会<b>整体替换</b>该输入的全部内容，并生成新的版本号；旧报告随即标记为
-    <b>过期</b>。两类文件可以分别或同时上传。CSV 须为 UTF-8，第一列为矿石名/样本编号，
-    其后四列依次为四项元素含量。单个文件上限 {{ max_upload_mb }} MB。
+    每次上传会<b>整体替换</b>该输入的全部内容，并生成新的版本号；替换基准或成品后旧报告随即标记为
+    <b>过期</b>，替换任一输入后相关补测计划也会标记为过期。三类文件可以分别或同时上传。
+    CSV 须为 UTF-8：基准/成品的第一列为矿石名/样本编号，其后四列为四项元素含量；
+    候选元素文件为同样三种原矿 × 至多 8 项候选元素，<b>原矿名称须与当前基准完全一致</b>。
+    单个文件上限 {{ max_upload_mb }} MB。
   </p>
 
   <form method="post" action="/inputs/upload" enctype="multipart/form-data" class="upload-form">
@@ -20,6 +22,11 @@
         <span class="upload-title">成品 CSV（样本编号 × 四项元素）</span>
         <span class="upload-example">sample_id,Fe,SiO2,Al2O3,CaO<br>S-1001,62.74,3.71,2.02,1.13</span>
         <input type="file" name="samples_file" accept=".csv,text/csv">
+      </label>
+      <label class="upload-box">
+        <span class="upload-title">候选元素 CSV（三种原矿 × 至多 8 项候选元素）</span>
+        <span class="upload-example">ore,P,TiO2,MnO<br>A,0.02,0.15,0.30</span>
+        <input type="file" name="candidates_file" accept=".csv,text/csv">
       </label>
     </div>
     <div class="actions">
@@ -58,6 +65,31 @@
         <p class="meta">前几个编号：{{ s.names|join("、") }}{% if s.count > s.names|length %} …{% endif %}</p>
       {% else %}
         <p class="empty">尚未上传成品 CSV。</p>
+      {% endif %}
+    </div>
+
+    <div class="input-card">
+      <h3>当前候选元素</h3>
+      {% set c = current.candidates %}
+      {% if c %}
+        <p class="meta">v{{ c.version }} · {{ c.filename or "未命名" }} · {{ c.created_at }} ·
+          <a href="/inputs/candidates/export.csv">导出</a></p>
+        <p class="meta">候选元素（{{ c.elements|length }} 项）：{{ c.elements|join("、") }}</p>
+        <table class="mini-table">
+          <thead><tr><th>原矿</th>{% for e in c.elements %}<th>{{ e }}</th>{% endfor %}</tr></thead>
+          <tbody>
+            {% for row in c.rows %}
+            <tr><th>{{ c.names[loop.index0] }}</th>{% for v in row %}<td>{{ v }}</td>{% endfor %}</tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% if not candidates_ores_match %}
+        <p class="notice notice-warn inline-notice">
+          候选文件的原矿名称与当前基准不一致，制定补测计划前需重新上传候选元素 CSV。
+        </p>
+        {% endif %}
+      {% else %}
+        <p class="empty">尚未上传候选元素 CSV（用于为非唯一样本制定补测计划）。</p>
       {% endif %}
     </div>
   </div>
@@ -182,8 +214,99 @@
     {% endif %}
     <p class="hint">
       “无法唯一确定”表示存在多组占比达到同一最小 SSE。此时占比、预测值与残差均以可达区间
-      呈现，其中的任何具体数值都不应被当作唯一解。
+      呈现，其中的任何具体数值都不应被当作唯一解。各矿占比区间只是逐矿的范围，
+      <b>不能把区间端点随意拼成一组配方</b>；如需唯一归因，请在下方制定补测计划。
     </p>
+  {% endif %}
+</section>
+
+<section class="card" id="plans">
+  <h2>4. 补测计划（针对无法唯一确定的样本）</h2>
+  <p class="hint">
+    对当前<b>未过期</b>报告中“无法唯一确定”的样本，从候选元素中找出能让其全部最优占比
+    仅剩一组的<b>最少</b>元素组合（最多两项），并列出所有并列组合。
+    计算假设<b>补测值精确且遵循原混合模型</b>：样本的真实占比是当前最优占比集合中的某一组，
+    补测元素的实测值恰好等于该组占比下的模型预测值。此时，只要所选元素能把最优集合中
+    任意两组占比区分开，补测后仍满足最小二乘最优的占比就只剩真实占比一组。
+    计划保存时绑定报告与候选文件版本；来源变化后旧计划标记为过期，但仍可查看。
+  </p>
+
+  {% if not report %}
+    <p class="empty">尚无报告。上传输入并计算占比后，才能制定补测计划。</p>
+  {% elif report.stale %}
+    <p class="empty">当前报告已过期。请重新计算占比后再制定补测计划。</p>
+  {% elif not plan_samples %}
+    <p class="empty">当前报告没有“无法唯一确定”的样本，无需补测。</p>
+  {% else %}
+    <form method="post" action="/plans/compute" class="plan-form">
+      <label for="plan-sample">选择非唯一样本（共 {{ plan_samples|length }} 个）：</label>
+      <select name="sample_id" id="plan-sample">
+        {% for s in plan_samples %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="primary"
+        {% if not current.candidates or not candidates_ores_match %}disabled{% endif %}>
+        计算并保存补测计划
+      </button>
+      {% if not current.candidates %}
+        <span class="hint">需要先上传候选元素 CSV。</span>
+      {% elif not candidates_ores_match %}
+        <span class="hint">候选文件与当前基准不一致，请重新上传。</span>
+      {% endif %}
+    </form>
+  {% endif %}
+
+  {% if plans %}
+  <div class="plan-list">
+    {% for plan in plans %}
+    <div class="plan-item">
+      <div class="plan-head">
+        <div>
+          <span class="plan-id">计划 #{{ plan.id }}</span>
+          <span class="meta">样本 {{ plan.sample_id }} · 报告 #{{ plan.report_id }} ·
+            基准 v{{ plan.baseline_version }} · 成品 v{{ plan.samples_version }} ·
+            候选 v{{ plan.candidates_version }} · {{ plan.created_at }}</span>
+        </div>
+        {% if plan.expired %}
+          <span class="badge badge-stale">已过期</span>
+        {% else %}
+          <span class="badge badge-fresh">有效</span>
+        {% endif %}
+      </div>
+      {% if plan.payload.solved %}
+        <p class="plan-result">
+          补测 <b>{{ plan.payload.min_elements }}</b> 项即可唯一确定：
+          {% for combo in plan.payload.combos %}
+            <span class="combo">{{ combo|join("＋") }}</span>{% if not loop.last %}<span class="meta">（并列）</span>{% endif %}
+          {% endfor %}
+        </p>
+      {% else %}
+        <p class="plan-result plan-unsolved">
+          最多 {{ plan.payload.max_elements }} 项内无法唯一确定。{{ plan.payload.reason }}
+        </p>
+      {% endif %}
+      <details class="plan-detail">
+        <summary>当前最优占比集合（{{ plan.payload.optimal_extremes|length }} 个端点，均为真实可达的最优配比）</summary>
+        <table class="mini-table">
+          <thead>
+            <tr><th>最优配比端点</th>{% for ore in plan.payload.ores %}<th>{{ ore }}</th>{% endfor %}</tr>
+          </thead>
+          <tbody>
+            {% for point in plan.payload.optimal_extremes %}
+            <tr><th>端点 {{ loop.index }}</th>
+              {% for w in point %}<td>{{ w|ratio }}</td>{% endfor %}
+            </tr>
+            {% endfor %}
+            <tr class="range-row"><th>逐矿区间（不可拼配）</th>
+              {% for r in plan.payload.weight_ranges %}
+              <td>{{ r[0]|percent(2) }} ~ {{ r[1]|percent(2) }}%</td>
+              {% endfor %}
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </div>
+    {% endfor %}
+  </div>
   {% endif %}
 </section>
 

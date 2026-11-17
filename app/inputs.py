@@ -41,6 +41,7 @@ MAX_ADJUSTED_EXPONENT = 100
 MAX_SAMPLES = 2000
 ELEMENT_COUNT = 4
 ORE_COUNT = 3
+MAX_CANDIDATE_ELEMENTS = 8
 
 _NUMBER_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 
@@ -96,6 +97,39 @@ class SamplesInput:
         return cls(
             elements=tuple(payload["elements"]),
             sample_ids=tuple(payload["sample_ids"]),
+            rows=tuple(
+                tuple(Fraction(value) for value in row)
+                for row in payload["rows"]
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CandidatesInput:
+    """Extra elements that could be re-measured to disambiguate a sample.
+
+    ``ores`` always matches the baseline ore order; rows are reordered to
+    the baseline order at parse time.
+    """
+
+    elements: tuple[str, ...]
+    ores: tuple[str, ...]
+    rows: tuple[tuple[Fraction, ...], ...]  # one row per ore
+
+    def to_payload(self) -> dict:
+        return {
+            "elements": list(self.elements),
+            "ores": list(self.ores),
+            "rows": [
+                [fraction_to_text(value) for value in row] for row in self.rows
+            ],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "CandidatesInput":
+        return cls(
+            elements=tuple(payload["elements"]),
+            ores=tuple(payload["ores"]),
             rows=tuple(
                 tuple(Fraction(value) for value in row)
                 for row in payload["rows"]
@@ -274,4 +308,88 @@ def parse_samples(raw: bytes) -> SamplesInput:
         elements=elements,
         sample_ids=tuple(sample_ids),
         rows=tuple(parsed_rows),
+    )
+
+
+def parse_candidates(raw: bytes, baseline: BaselineInput) -> CandidatesInput:
+    """Parse the candidate-elements CSV against the current baseline.
+
+    The file holds the same three ores as the baseline (any row order;
+    matched by name) and 1..8 candidate element columns.  Candidate
+    elements must be new: re-measuring an element the baseline already
+    tracks cannot add information, so overlaps are rejected.
+    """
+
+    label = "候选元素"
+    rows = _read_rows(raw, label)
+    line_no, raw_header = rows[0]
+    if not 1 <= len(raw_header) - 1 <= MAX_CANDIDATE_ELEMENTS:
+        raise InputValidationError(
+            f"{label}表头须为标识列加 1~{MAX_CANDIDATE_ELEMENTS} 个候选元素列，"
+            f"实际 {len(raw_header)} 列"
+        )
+    header = [cell.strip() for cell in raw_header]
+    if any(not cell for cell in header):
+        raise InputValidationError(f"第 {line_no} 行：表头存在空列名")
+    if len(set(header)) != len(header):
+        raise InputValidationError(f"第 {line_no} 行：表头列名不能重复")
+    elements = tuple(header[1:])
+
+    overlap = [name for name in elements if name in baseline.elements]
+    if overlap:
+        raise InputValidationError(
+            "候选元素不能与基准已测元素重复（重复测量不增加信息）："
+            + "、".join(overlap)
+        )
+
+    data: list[tuple[int, list[str]]] = []
+    for row_line_no, row in rows[1:]:
+        if len(row) != len(header):
+            raise InputValidationError(
+                f"第 {row_line_no} 行：应有 {len(header)} 列，"
+                f"实际 {len(row)} 列"
+            )
+        data.append((row_line_no, [cell.strip() for cell in row]))
+    if len(data) != ORE_COUNT:
+        raise InputValidationError(
+            f"{label} CSV 必须恰好包含 {ORE_COUNT} 种原矿，实际 {len(data)} 行"
+        )
+
+    by_ore: dict[str, tuple[int, list[str]]] = {}
+    for row_line_no, row in data:
+        ore = row[0]
+        if not ore:
+            raise InputValidationError(f"第 {row_line_no} 行：原矿名称不能为空")
+        if ore in by_ore:
+            raise InputValidationError(
+                f"第 {row_line_no} 行：原矿名称“{ore}”重复"
+            )
+        by_ore[ore] = (row_line_no, row)
+
+    missing = [ore for ore in baseline.ores if ore not in by_ore]
+    extra = [ore for ore in by_ore if ore not in baseline.ores]
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("缺少：" + "、".join(missing))
+        if extra:
+            details.append("多出：" + "、".join(extra))
+        raise InputValidationError(
+            "候选文件的原矿名称须与当前基准完全一致（"
+            + "；".join(details)
+            + "）。基准原矿为：" + "、".join(baseline.ores)
+        )
+
+    parsed_rows: list[tuple[Fraction, ...]] = []
+    for ore in baseline.ores:  # reorder to the baseline ore order
+        row_line_no, row = by_ore[ore]
+        parsed_rows.append(
+            tuple(
+                parse_content(value, line_no=row_line_no, column=elements[index])
+                for index, value in enumerate(row[1:])
+            )
+        )
+
+    return CandidatesInput(
+        elements=elements, ores=tuple(baseline.ores), rows=tuple(parsed_rows)
     )
